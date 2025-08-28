@@ -4,134 +4,111 @@ using Lux, Zygote, Random, Optimisers, NNlib, Statistics
 
 module HRMCommon
 
-using Lux, NNlib, Statistics
+using Lux, NNlib, Random
 
-# tokenwise adapter: run (d,B) layers over (d,L,B)
-_as3d(X) = ndims(X) == 2 ? (reshape(X, size(X,1), 1, size(X,2)), true) :
-          ndims(X) == 3 ? (X, false) :
-          error("Expected 2-D or 3-D tensor, got ndims=$(ndims(X))")
 
-"Apply any (d,B) layer/Chain tokenwise to X::(d,L,B)."
-function apply_tokenwise(layer, ps_layer, st_layer, X)
-    X3, was2d = _as3d(X)
-    d, L, B = size(X3)
-    X2 = reshape(X3, d, L * B)
-    Y2, st2 = Lux.apply(layer, X2, ps_layer, st_layer)
-    Y3 = reshape(Y2, d, L, B)
-    return was2d ? dropdims(Y3; dims=2) : Y3, st2
+# minimal wrapper: apply any (d,B) layer tokenwise over (d,L,B)
+struct Tokenwise{L}
+    layer::L
 end
 
-
-function make_positional_layer(d::Int; kind::Symbol = :sinusoidal)
-    if kind === :none
-        layer   = nothing
-        applyfn = (X, _layer, _ps, st) -> (X, st)   # no-op
-        return layer, applyfn
-
-    elseif kind === :sinusoidal
-        pe = Lux.SinusoidalPositionalEmbedding(d)
-        applyfn = (X, layer, ps, st) -> begin
-            # ensure we work with (d, L, B)
-            X3, _ = _as3d(X)
-            L = size(X3, 2)
-            B = size(X3, 3)
-
-            # feed (L, B) into the PE layer so output is (d, L, B)
-            # content of this dummy input is irrelevant; only its shape matters.
-            dummy = zeros(eltype(X3), L, B)
-            P, st2 = Lux.apply(layer, dummy, ps, st)  # P :: (d, L, B)
-            return X .+ P, st2
-        end
-        return pe, applyfn
-
-    elseif kind === :learned
-        @assert L_max > 0 "Provide L_max for learned positional embeddings"
-        embed = Lux.Embedding(L_max => d)
-        applyfn = (X, layer, ps, st) -> begin
-            X3, _ = _as3d(X)
-            L, B = size(X3, 2), size(X3, 3)
-            positions = reshape(1:L, L, 1)              # (L, 1)
-            E, st2 = Lux.apply(layer, positions, ps, st) # (d, L)
-            P = reshape(E, d, L, 1) .* ones(eltype(X3), 1, 1, B)  # (d, L, B)
-            return X .+ P, st2
-        end
-        return embed, applyfn
-
-    else
-        error("Unknown positional kind: $kind (use :none, :sinusoidal, or :learned)")
-    end
+function Lux.setup(rng::AbstractRNG, tw::Tokenwise)
+    ps, st = Lux.setup(rng, tw.layer)
+    return (; layer=ps), (; layer=st)
 end
 
+function Lux.apply(tw::Tokenwise, X, ps, st)
+    @assert ndims(X) == 3 "Tokenwise expects (d, L, B); got ndims=$(ndims(X))"
+    d, L, B = size(X)
+    X2 = reshape(X, d, L*B)
+    Y2, st_layer = Lux.apply(tw.layer, X2, ps.layer, st.layer)
+    return reshape(Y2, d, L, B), (; layer=st_layer)
+end
 
-"""
-make_transformer_block(d;
-    nheads,
-    ff_mult=4,
-    attention_dropout_probability=0.0,
-    pos_kind=:sinusoidal,
+# single public block: Pre-LN + MHA + residual; Pre-LN + FF + residual
+struct TransformerBlock{PL,M,LN1,FF,LN2} 
+    pos_kind::Symbol
+    pos_layer::PL
+    mha::M
+    ln1::LN1
+    ff::FF
+    ln2::LN2
+end
+
+function TransformerBlock(d::Int;
+    nheads::Int,
+    ff_mult::Int=4,
+    attention_dropout_probability::Real=0.0,
+    pos_kind::Symbol=:sinusoidal,
     pos_L_max::Int=0,
     dense_kwargs=(;))
 
-Returns a NamedTuple:
-  (pos_layer, pos_apply, mha, ln1, ff, ln2)
+    pos_layer =
+        pos_kind === :none        ? nothing :
+        pos_kind === :sinusoidal  ? Lux.SinusoidalPositionalEmbedding(d) :
+        pos_kind === :learned     ? (pos_L_max > 0 ? Lux.Embedding(pos_L_max => d)
+                                                   : error("Provide pos_L_max>0 for :learned")) :
+        error("Unknown pos_kind=$pos_kind")
 
-- `pos_layer, pos_apply` implement positional encodings (or no-op).
-- Inputs/outputs of the block are (d, L, B).
-"""
-function make_transformer_block(d::Int;
-                                nheads::Int,
-                                ff_mult::Int = 4,
-                                attention_dropout_probability::Float64 = 0.0,
-                                pos_kind::Symbol = :sinusoidal,
-                                pos_L_max::Int = 0,         
-                                dense_kwargs = (;))
-    
-    # pos_layer, pos_apply = make_positional_layer(d; kind=pos_kind, L_max=pos_L_max)
+    mha = Lux.MultiHeadAttention(d; nheads=nheads,
+        attention_dropout_probability=attention_dropout_probability)
 
-    pos_layer, pos_apply = make_positional_layer(d; kind=pos_kind)
+    ln1 = Tokenwise(Lux.LayerNorm(d))
+    ff  = Tokenwise(Lux.Chain(
+            Lux.Dense(d => ff_mult*d, NNlib.gelu; dense_kwargs...),
+            Lux.Dense(ff_mult*d => d;             dense_kwargs...)
+          ))
+    ln2 = Tokenwise(Lux.LayerNorm(d))
 
-    mha = Lux.MultiHeadAttention(d;
-        nheads = nheads,
-        attention_dropout_probability = attention_dropout_probability)
-    ln1 = Lux.LayerNorm(d)
-    ff  = Lux.Chain(
-            Lux.Dense(d => ff_mult * d, NNlib.gelu; dense_kwargs...),
-            Lux.Dense(ff_mult * d => d;            dense_kwargs...)
-          )
-    ln2 = Lux.LayerNorm(d)
-    return (; pos_layer, pos_apply, mha, ln1, ff, ln2)
+    return TransformerBlock(pos_kind, pos_layer, mha, ln1, ff, ln2)
 end
 
+function Lux.setup(rng::AbstractRNG, blk::TransformerBlock)
+    ps_pos, st_pos = blk.pos_layer === nothing ? ((;), (;)) : Lux.setup(rng, blk.pos_layer)
+    ps_mha, st_mha = Lux.setup(rng, blk.mha)
+    ps_ln1, st_ln1 = Lux.setup(rng, blk.ln1)
+    ps_ff,  st_ff  = Lux.setup(rng, blk.ff)
+    ps_ln2, st_ln2 = Lux.setup(rng, blk.ln2)
+    return (; pos=ps_pos, mha=ps_mha, ln1=ps_ln1, ff=ps_ff, ln2=ps_ln2),
+           (; pos=st_pos, mha=st_mha, ln1=st_ln1, ff=st_ff, ln2=st_ln2)
+end
 
-function transformer_forward!(blk, ps_blk, st_blk, X)
-    # 0 positional encodings (if any)
-    if blk.pos_layer === nothing
+function Lux.apply(blk::TransformerBlock, X, ps, st)
+    @assert ndims(X) == 3 "TransformerBlock expects (d, L, B)"
+    d, L, B = size(X)
+
+    # positional encoding 
+    if blk.pos_kind === :none
         Xp = X
-        st_pos = nothing
+        st_pos = st.pos
+    elseif blk.pos_kind === :sinusoidal
+        P, stp = Lux.apply(blk.pos_layer, zeros(eltype(X), L, B), ps.pos, st.pos)  # (d,L,B)
+        Xp, st_pos = X .+ P, stp
+    elseif blk.pos_kind === :learned
+        E, stp = Lux.apply(blk.pos_layer, reshape(1:L, L, 1), ps.pos, st.pos)     # (d,L)
+        Xp, st_pos = X .+ reshape(E, d, L, 1), stp                                 # broadcasts over B
     else
-        Xp, st_pos = blk.pos_apply(X, blk.pos_layer, ps_blk.pos_layer, st_blk.pos_layer)
+        error("Unknown pos_kind=$(blk.pos_kind)")
     end
 
-    # 1 Pre-LN + MHA + residual
-    Xn1, st_ln1 = apply_tokenwise(blk.ln1, ps_blk.ln1, st_blk.ln1, Xp)
-
-    # MHA returns ( (A, attn_scores), st_mha )
-    (A, _attn_scores), st_mha =
-        Lux.apply(blk.mha, (Xn1, Xn1, Xn1), ps_blk.mha, st_blk.mha)
-
+    # pre-LN + MHA + residual
+    Xn1, st_ln1 = Lux.apply(blk.ln1, Xp, ps.ln1, st.ln1)
+    (A, _attn), st_mha = Lux.apply(blk.mha, (Xn1, Xn1, Xn1), ps.mha, st.mha)
     X1 = Xp .+ A
 
-    # 2) Pre-LN + FFN + residual
-    Xn2, st_ln2 = apply_tokenwise(blk.ln2, ps_blk.ln2, st_blk.ln2, X1)
-    F,   st_ff  = apply_tokenwise(blk.ff,  ps_blk.ff,  st_blk.ff,  Xn2)
+    # pre-LN + FF + residual
+    Xn2, st_ln2 = Lux.apply(blk.ln2, X1, ps.ln2, st.ln2)
+    F,   st_ff  = Lux.apply(blk.ff,  Xn2, ps.ff,  st.ff)
     Y = X1 .+ F
 
-    st_out = (; pos_layer = st_pos, mha=st_mha, ln1=st_ln1, ff=st_ff, ln2=st_ln2)
-    return Y, st_out
+    return Y, (; pos=st_pos, mha=st_mha, ln1=st_ln1, ff=st_ff, ln2=st_ln2)
 end
 
+# small helper kept for convenience
+mean_over_len(X) = dropdims(mean(X; dims=2), dims=2)
 
+make_transformer_block(args...; kwargs...) = TransformerBlock(args...; kwargs...)
 
-mean_over_len(X) = dropdims(mean(X; dims=2), dims=2)  # (d,L,B)->(d,B)
+export Tokenwise, TransformerBlock, make_transformer_block, mean_over_len
 
 end # module
