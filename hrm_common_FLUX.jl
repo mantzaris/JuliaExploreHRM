@@ -1,0 +1,260 @@
+
+using Flux, Zygote, Random, Optimisers, NNlib, Statistics
+
+
+
+module HRMFlux
+
+using Flux
+using NNlib: gelu
+using Zygote
+using Random, Statistics
+using PositionalEmbeddings  # ] add PositionalEmbeddings
+
+
+# transformer block (Pre-LN, MHA, FF, residual)
+"""
+A minimal Transformer block compatible with (d, L, B) tensors.
+
+Fields:
+- positional_encoding_kind :: Symbol  (:none | :sinusoidal | :learned)
+- positional_layer         :: Union{Nothing, PositionalEmbeddings.AbsolutePE, Flux.Embedding}
+- attention                :: Flux.MultiHeadAttention
+- norm_before_attention    :: Flux.LayerNorm
+- feedforward              :: Flux.Chain
+- norm_before_feedforward  :: Flux.LayerNorm
+"""
+struct TransformerBlock{PL}
+    positional_encoding_kind::Symbol
+    positional_layer::PL
+    attention::Flux.MultiHeadAttention
+    norm_before_attention::Flux.LayerNorm
+    feedforward::Flux.Chain
+    norm_before_feedforward::Flux.LayerNorm
+end
+
+
+"""
+    TransformerBlock(d;
+        nheads,
+        ff_mult=4,
+        attention_dropout_probability=0.0,
+        positional_encoding_kind=:sinusoidal,
+        pos_L_max=0)
+
+Construct a block for feature size `d`. Supported positional encodings:
+- `:none`         : no positional encoding
+- `:sinusoidal`   : PositionalEmbeddings.AbsolutePE(d, pos_L_max)  (library)
+- `:learned`      : Flux.Embedding(pos_L_max => d)                 (trainable)
+`pos_L_max` must be > 0 for `:sinusoidal` or `:learned`.
+"""
+function TransformerBlock(d::Int;
+    nheads::Int,
+    ff_mult::Int=4,
+    attention_dropout_probability::Real=0.0,
+    positional_encoding_kind::Symbol=:sinusoidal,
+    pos_L_max::Int=0)
+
+    pos_layer =
+        positional_encoding_kind === :none       ? nothing :
+        positional_encoding_kind === :sinusoidal ? (pos_L_max > 0 ?
+                                                    PositionalEmbeddings.AbsolutePE(d, pos_L_max) :
+                                                    error("Provide pos_L_max>0 for :sinusoidal")) :
+        positional_encoding_kind === :learned    ? (pos_L_max > 0 ?
+                                                    Flux.Embedding(pos_L_max => d) :
+                                                    error("Provide pos_L_max>0 for :learned")) :
+        error("Unknown positional_encoding_kind=$(positional_encoding_kind)")
+
+    # Flux.MultiHeadAttention expects (d_model, seq_len, batch)
+    mha = Flux.MultiHeadAttention(d; nheads=nheads, dropout_prob=attention_dropout_probability)
+
+    # LayerNorm(d) normalizes over the feature dim (first dim in (d,L,B))
+    ln1 = Flux.LayerNorm(d)
+    ff  = Flux.Chain(
+            Flux.Dense(d => ff_mult*d, gelu),
+            Flux.Dense(ff_mult*d => d)
+          )
+    ln2 = Flux.LayerNorm(d)
+
+    return TransformerBlock(positional_encoding_kind, pos_layer, mha, ln1, ff, ln2)
+end
+
+
+# AbsolutePE (seq_len, channels, batch) = (L, d, B).
+# wrapper adds PE by permuting around the call (no in-place mutation)
+add_absolute_pe(X::AbstractArray, pe_layer) = begin
+    X_perm = permutedims(X, (2, 1, 3))    # (L, d, B)
+    X_pos  = pe_layer(X_perm)             # (L, d, B) with PE applied
+    permutedims(X_pos, (2, 1, 3))         # (d, L, B)
+end
+
+
+"""
+    forward_block(blk, X) -> Y
+
+Named forward pass for a `TransformerBlock`. `X` must be (d, L, B).
+- adds positional encodings (AbsolutePE for :sinusoidal; Flux.Embedding for :learned)
+- pre-LN + self-attention + residual, then Pre-LN + FF + residual
+"""
+function forward_block(blk::TransformerBlock, X::AbstractArray)
+    @assert ndims(X) == 3 "TransformerBlock expects (d, L, B)"
+    d, L, B = size(X)
+
+    # Positional encoding
+    Xp = if blk.positional_encoding_kind === :none || blk.positional_layer === nothing
+        X
+    elseif blk.positional_encoding_kind === :sinusoidal
+        add_absolute_pe(X, blk.positional_layer)     # library PE
+    elseif blk.positional_encoding_kind === :learned
+        idx = reshape(collect(1:L), L, 1)            # (L, 1)
+        E   = blk.positional_layer(idx)              # (d, L, 1)
+        X .+ E                                       # broadcast over batch
+    else
+        error("Unknown positional_encoding_kind=$(blk.positional_encoding_kind)")
+    end
+
+    # Pre-LN + self-attention + residual
+    Xn1 = blk.norm_before_attention(Xp)
+    attn_out = blk.attention(Xn1)                    # self-attn sugar: mha(X) ≡ mha(X,X,X)
+    A = attn_out isa Tuple ? attn_out[1] : attn_out
+    X1 = Xp .+ A
+
+    # Pre-LN + FF + residual
+    Xn2 = blk.norm_before_feedforward(X1)
+    F   = blk.feedforward(Xn2)
+    return X1 .+ F
+end
+
+
+# mean over length dimension (2nd dim)
+mean_over_len(X) = dropdims(mean(X; dims=2), dims=2)
+
+make_transformer_block(args...; kwargs...) = TransformerBlock(args...; kwargs...)
+
+
+# build the HRM stack (Flux layers)
+"""
+    build_models(cfg; positional_encoding_kind=:sinusoidal, pos_L_max=0)
+
+cfg fields expected:
+  d_in, d_hid, d_out, d_embed, num_tokens,
+  l_heads, l_ff_mult, h_heads, h_ff_mult, dropout
+
+Returns a NamedTuple:
+  tok_emb, emb_to_hid, raw_to_hid,
+  l_token_from_low, l_token_from_task, l_token_from_high,
+  Lblk, Hblk, Hpost, fO
+"""
+function build_models(cfg; positional_encoding_kind::Symbol = :sinusoidal, pos_L_max::Int = 0)
+    d_in        = cfg.d_in
+    d_hid       = cfg.d_hid
+    d_out       = cfg.d_out
+    d_embed     = cfg.d_embed
+    num_tokens  = cfg.num_tokens
+    l_heads     = cfg.l_heads
+    l_ff_mult   = cfg.l_ff_mult
+    h_heads     = cfg.h_heads
+    h_ff_mult   = cfg.h_ff_mult
+    dropout     = cfg.dropout
+
+    # pick a safe default for PE lengths if none provided
+    pos_L_max_eff = pos_L_max > 0 ? pos_L_max : max(cfg.T, 3, 512)
+
+    # input encoders
+    tok_emb    = num_tokens > 0 ? Flux.Embedding(num_tokens => d_embed) : nothing
+    emb_to_hid = Flux.Dense(d_embed => d_hid, gelu)   # IDs path
+    raw_to_hid = Flux.Dense(d_in    => d_hid, gelu)   # raw float path
+
+    # adapters to form 3-token micro-sequence for the L block
+    l_token_from_low  = Flux.Dense(d_hid => d_hid)
+    l_token_from_task = Flux.Dense(d_hid => d_hid)
+    l_token_from_high = Flux.Dense(d_hid => d_hid)
+
+    # L and H Transformer blocks (same PE config)
+    Lblk = TransformerBlock(d_hid;
+        nheads = l_heads,
+        ff_mult = l_ff_mult,
+        attention_dropout_probability = dropout,
+        positional_encoding_kind = positional_encoding_kind,
+        pos_L_max = pos_L_max_eff)
+
+    Hblk = TransformerBlock(d_hid;
+        nheads = h_heads,
+        ff_mult = h_ff_mult,
+        attention_dropout_probability = dropout,
+        positional_encoding_kind = positional_encoding_kind,
+        pos_L_max = pos_L_max_eff)
+
+    # post-pool head for H, and final readout
+    Hpost = Flux.Chain(Flux.Dense(d_hid => d_hid, gelu))
+    fO    = Flux.Chain(Flux.Dense(d_hid => d_out))
+
+    return (; tok_emb, emb_to_hid, raw_to_hid,
+             l_token_from_low, l_token_from_task, l_token_from_high,
+             Lblk, Hblk, Hpost, fO)
+end
+
+
+
+# state init and one HRM segment
+"Initialize (low_state, high_state) as (d_hid, batch) Float32 arrays."
+init_states(batch::Int, d_hid::Int) =
+    (zeros(Float32, d_hid, batch), zeros(Float32, d_hid, batch))
+
+
+"""
+    run_segment!(models, x_in, low_state, high_state; N, T, cfg)
+
+Flux version of a single HRM segment. Returns (yhat, low_state_out, high_state_out).
+"""
+function run_segment!(models, x_in, low_state, high_state; N::Int, T::Int, cfg)
+    # 1 encode input into task vector e_task (no attention here)
+    if cfg.num_tokens > 0
+        # x_in are Int IDs of shape (d_in, B)
+        E = models.tok_emb(x_in)                                         # (d_embed, d_in, B)
+        e_task = models.emb_to_hid(dropdims(mean(E; dims=2), dims=2))    # (d_hid, B)
+    else
+        # raw float path: x_in :: (d_in, B) -> (d_hid, B)
+        e_task = models.raw_to_hid(x_in)                                 # (d_hid, B)
+    end
+
+    # 2 HRM cycles
+    @inbounds for k in 1:N
+        # buffer to collect low states across inner steps
+        Lbuf = Zygote.Buffer(zeros(Float32, size(low_state,1), T, size(low_state,2)))  # (d_hid, T, B)
+
+        for t in 1:T
+            # build 3-token micro-sequence (low, task, high), (d_hid, 3, B)
+            tok_low  = models.l_token_from_low(  low_state)   # (d_hid, B)
+            tok_tsk  = models.l_token_from_task(e_task)       # (d_hid, B)
+            tok_hig  = models.l_token_from_high(high_state)   # (d_hid, B)
+            Xl = permutedims(cat(tok_low, tok_tsk, tok_hig; dims=3), (1, 3, 2))
+
+            # L block; take token 1 as the updated low state
+            Xl_out = forward_block(models.Lblk, Xl)           # (d_hid, 3, B)
+            low_state = Xl_out[:, 1, :]                       # copy (not view) for AD safety
+
+            # Save into buffer (write directly to Buffer, not to a SubArray)
+            Lbuf[:, t, :] = low_state
+        end
+
+        # H block over collected low states
+        H_in  = copy(Lbuf)                                    # (d_hid, T, B)
+        H_out = forward_block(models.Hblk, H_in)
+        H_vec = dropdims(mean(H_out; dims=2), dims=2)         # (d_hid, B)
+        H_vec = models.Hpost(H_vec)                           # (d_hid, B)
+        high_state = high_state .+ H_vec
+    end
+
+    # 3 readout
+    yhat = models.fO(high_state)                              # (d_out, B)
+
+    return yhat, low_state, high_state
+end
+
+
+export TransformerBlock, forward_block, make_transformer_block, mean_over_len,
+       build_models, init_states, run_segment!
+
+
+end # module

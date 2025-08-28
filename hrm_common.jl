@@ -25,52 +25,52 @@ function Lux.apply(tw::Tokenwise, X, ps, st)
     return reshape(Y2, d, L, B), (; layer=st_layer)
 end
 
-# single public block: Pre-LN + MHA + residual; Pre-LN + FF + residual
+# single public block: Pre-LN + m_self_attention + residual; Pre-LN + FF + residual
 struct TransformerBlock{PL,M,LN1,FF,LN2}
-    pos_kind::Symbol
-    pos_layer::PL
-    mha::M
-    ln1::LN1
-    ff::FF
-    ln2::LN2
+    positional_encoding_kind::Symbol
+    positional_encoding_layer::PL
+    m_self_attention::M
+    norm_before_attention::LN1
+    feedforward::FF
+    norm_before_feedforward::LN2
 end
 
 function TransformerBlock(d::Int;
     nheads::Int,
     ff_mult::Int=4,
     attention_dropout_probability::Real=0.0,
-    pos_kind::Symbol=:sinusoidal,
+    positional_encoding_kind::Symbol=:sinusoidal,
     pos_L_max::Int=0,
     dense_kwargs=(;))
 
-    pos_layer =
-        pos_kind === :none        ? nothing :
-        pos_kind === :sinusoidal  ? Lux.SinusoidalPositionalEmbedding(d) :
-        pos_kind === :learned     ? (pos_L_max > 0 ? Lux.Embedding(pos_L_max => d)
+    positional_encoding_layer =
+        positional_encoding_kind === :none        ? nothing :
+        positional_encoding_kind === :sinusoidal  ? Lux.SinusoidalPositionalEmbedding(d) :
+        positional_encoding_kind === :learned     ? (pos_L_max > 0 ? Lux.Embedding(pos_L_max => d)
                                                    : error("Provide pos_L_max>0 for :learned")) :
-        error("Unknown pos_kind=$pos_kind")
+        error("Unknown positional_encoding_kind=$positional_encoding_kind")
 
-    mha = Lux.MultiHeadAttention(d; nheads=nheads,
+    m_self_attention = Lux.MultiHeadAttention(d; nheads=nheads,
         attention_dropout_probability=attention_dropout_probability)
 
-    ln1 = Tokenwise(Lux.LayerNorm(d))
-    ff  = Tokenwise(Lux.Chain(
+    norm_before_attention = Tokenwise(Lux.LayerNorm(d))
+    feedforward  = Tokenwise(Lux.Chain(
             Lux.Dense(d => ff_mult*d, NNlib.gelu; dense_kwargs...),
             Lux.Dense(ff_mult*d => d;             dense_kwargs...)
           ))
-    ln2 = Tokenwise(Lux.LayerNorm(d))
+    norm_before_feedforward = Tokenwise(Lux.LayerNorm(d))
 
-    return TransformerBlock(pos_kind, pos_layer, mha, ln1, ff, ln2)
+    return TransformerBlock(positional_encoding_kind, positional_encoding_layer, m_self_attention, norm_before_attention, feedforward, norm_before_feedforward)
 end
 
 function Lux.setup(rng::AbstractRNG, blk::TransformerBlock)
-    ps_pos, st_pos = blk.pos_layer === nothing ? ((;), (;)) : Lux.setup(rng, blk.pos_layer)
-    ps_mha, st_mha = Lux.setup(rng, blk.mha)
-    ps_ln1, st_ln1 = Lux.setup(rng, blk.ln1)
-    ps_ff,  st_ff  = Lux.setup(rng, blk.ff)
-    ps_ln2, st_ln2 = Lux.setup(rng, blk.ln2)
-    return (; pos=ps_pos, mha=ps_mha, ln1=ps_ln1, ff=ps_ff, ln2=ps_ln2),
-           (; pos=st_pos, mha=st_mha, ln1=st_ln1, ff=st_ff, ln2=st_ln2)
+    ps_pos, st_pos = blk.positional_encoding_layer === nothing ? ((;), (;)) : Lux.setup(rng, blk.positional_encoding_layer)
+    ps_mha, st_mha = Lux.setup(rng, blk.m_self_attention)
+    ps_ln1, st_ln1 = Lux.setup(rng, blk.norm_before_attention)
+    ps_ff,  st_ff  = Lux.setup(rng, blk.feedforward)
+    ps_ln2, st_ln2 = Lux.setup(rng, blk.norm_before_feedforward)
+    return (; pos=ps_pos, m_self_attention=ps_mha, norm_before_attention=ps_ln1, feedforward=ps_ff, norm_before_feedforward=ps_ln2),
+           (; pos=st_pos, m_self_attention=st_mha, norm_before_attention=st_ln1, feedforward=st_ff, norm_before_feedforward=st_ln2)
 end
 
 function Lux.apply(blk::TransformerBlock, X, ps, st)
@@ -78,30 +78,30 @@ function Lux.apply(blk::TransformerBlock, X, ps, st)
     d, L, B = size(X)
 
     # positional encoding 
-    if blk.pos_kind === :none
+    if blk.positional_encoding_kind === :none
         Xp = X
         st_pos = st.pos
-    elseif blk.pos_kind === :sinusoidal
-        P, stp = Lux.apply(blk.pos_layer, zeros(eltype(X), L, B), ps.pos, st.pos)  # (d,L,B)
+    elseif blk.positional_encoding_kind === :sinusoidal
+        P, stp = Lux.apply(blk.positional_encoding_layer, zeros(eltype(X), L, B), ps.positional_encoding, st.pos)  # (d,L,B)
         Xp, st_pos = X .+ P, stp
-    elseif blk.pos_kind === :learned
-        E, stp = Lux.apply(blk.pos_layer, reshape(1:L, L, 1), ps.pos, st.pos)     # (d,L)
+    elseif blk.positional_encoding_kind === :learned
+        E, stp = Lux.apply(blk.positional_encoding_layer, reshape(1:L, L, 1), ps.positional_encoding, st.pos)     # (d,L)
         Xp, st_pos = X .+ reshape(E, d, L, 1), stp                                 # broadcasts over B
     else
-        error("Unknown pos_kind=$(blk.pos_kind)")
+        error("Unknown positional_encoding_kind=$(blk.positional_encoding_kind)")
     end
 
-    # pre-LN + MHA + residual
-    Xn1, st_ln1 = Lux.apply(blk.ln1, Xp, ps.ln1, st.ln1)
-    (A, _attn), st_mha = Lux.apply(blk.mha, (Xn1, Xn1, Xn1), ps.mha, st.mha)
+    # pre-LN + m_self_attention + residual
+    Xn1, st_ln1 = Lux.apply(blk.norm_before_attention, Xp, ps.norm_before_attention, st.norm_before_attention)
+    (A, _attn), st_mha = Lux.apply(blk.m_self_attention, (Xn1, Xn1, Xn1), ps.m_self_attention, st.m_self_attention)
     X1 = Xp .+ A
 
     # pre-LN + FF + residual
-    Xn2, st_ln2 = Lux.apply(blk.ln2, X1, ps.ln2, st.ln2)
-    F,   st_ff  = Lux.apply(blk.ff,  Xn2, ps.ff,  st.ff)
+    Xn2, st_ln2 = Lux.apply(blk.norm_before_feedforward, X1, ps.norm_before_feedforward, st.norm_before_feedforward)
+    F,   st_ff  = Lux.apply(blk.feedforward,  Xn2, ps.feedforward,  st.feedforward)
     Y = X1 .+ F
 
-    return Y, (; pos=st_pos, mha=st_mha, ln1=st_ln1, ff=st_ff, ln2=st_ln2)
+    return Y, (; pos=st_pos, m_self_attention=st_mha, norm_before_attention=st_ln1, feedforward=st_ff, norm_before_feedforward=st_ln2)
 end
 
 # small helper kept for convenience
@@ -158,7 +158,7 @@ end
 
 
 """
-    build_models(cfg; pos_kind=:sinusoidal)
+    build_models(cfg; positional_encoding_kind=:sinusoidal)
 
 Construct the small HRM stack using the provided configuration `cfg` (NamedTuple).
 Expected `cfg` fields:
@@ -170,7 +170,7 @@ Returns a NamedTuple with fields:
   l_token_from_low, l_token_from_task, l_token_from_high,
   Lblk, Hblk, Hpost, fO
 """
-function build_models(cfg; pos_kind::Symbol = :sinusoidal)
+function build_models(cfg; positional_encoding_kind::Symbol = :sinusoidal)
     d_in        = cfg.d_in
     d_hid       = cfg.d_hid
     d_out       = cfg.d_out
@@ -197,13 +197,13 @@ function build_models(cfg; pos_kind::Symbol = :sinusoidal)
         nheads = l_heads,
         ff_mult = l_ff_mult,
         attention_dropout_probability = dropout,
-        pos_kind = pos_kind)
+        positional_encoding_kind = positional_encoding_kind)
 
     Hblk = TransformerBlock(d_hid;
         nheads = h_heads,
         ff_mult = h_ff_mult,
         attention_dropout_probability = dropout,
-        pos_kind = pos_kind)
+        positional_encoding_kind = positional_encoding_kind)
 
     # post-pool head for H, and final readout
     Hpost = Lux.Chain(Lux.Dense(d_hid => d_hid, NNlib.gelu))
