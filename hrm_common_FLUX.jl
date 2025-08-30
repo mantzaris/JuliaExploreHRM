@@ -253,8 +253,144 @@ function run_segment!(models, x_in, low_state, high_state; N::Int, T::Int, cfg)
 end
 
 
+function build_models_GRU(cfg; positional_encoding_kind::Symbol = :sinusoidal, pos_L_max::Int = 0)
+    d_in        = cfg.d_in
+    d_hid       = cfg.d_hid
+    d_out       = cfg.d_out
+    d_embed     = cfg.d_embed
+    num_tokens  = cfg.num_tokens
+    l_heads     = cfg.l_heads
+    l_ff_mult   = cfg.l_ff_mult
+    h_heads     = cfg.h_heads
+    h_ff_mult   = cfg.h_ff_mult
+    dropout     = cfg.dropout
+
+    # pick a safe default for PE lengths if none provided
+    pos_L_max_eff = pos_L_max > 0 ? pos_L_max : max(cfg.T, 3, 512)
+
+    # input encoders
+    tok_emb    = num_tokens > 0 ? Flux.Embedding(num_tokens => d_embed) : nothing
+    # tok_rnn    = num_tokens > 0 ? Flux.GRU(d_embed) : nothing   # NEW: sequence encoder
+    tok_rnn = nothing
+    if num_tokens > 0
+        # Try Flux APIs in order: GRU(::Pair), GRU(::Int), and Recur(GRUCell)
+        tok_rnn = try
+            Flux.GRU(d_embed => d_embed)                # many Flux versions
+        catch
+            try
+                Flux.GRU(d_embed)                       # some Flux versions
+            catch
+                Flux.Recur(Flux.GRUCell(d_embed => d_embed))  # always works
+            end
+        end
+    end
+
+    emb_to_hid = Flux.Dense(d_embed => d_hid, gelu)                      # map encoder state -> d_hid
+    raw_to_hid = Flux.Dense(d_in    => d_hid, gelu)                      # raw float path (unchanged)
+
+    # adapters to form 3-token micro-sequence for the L block
+    l_token_from_low  = Flux.Dense(d_hid => d_hid)
+    l_token_from_task = Flux.Dense(d_hid => d_hid)
+    l_token_from_high = Flux.Dense(d_hid => d_hid)
+
+    # L and H Transformer blocks (same PE config)
+    Lblk = TransformerBlock(d_hid;
+        nheads = l_heads,
+        ff_mult = l_ff_mult,
+        attention_dropout_probability = dropout,
+        positional_encoding_kind = positional_encoding_kind,
+        pos_L_max = pos_L_max_eff)
+
+    Hblk = TransformerBlock(d_hid;
+        nheads = h_heads,
+        ff_mult = h_ff_mult,
+        attention_dropout_probability = dropout,
+        positional_encoding_kind = positional_encoding_kind,
+        pos_L_max = pos_L_max_eff)
+
+    # post-pool head for H, and final readout
+    Hpost = Flux.Chain(Flux.Dense(d_hid => d_hid, gelu))
+    fO    = Flux.Chain(Flux.Dense(d_hid => d_out))
+
+    return (; tok_emb, tok_rnn, emb_to_hid, raw_to_hid,
+             l_token_from_low, l_token_from_task, l_token_from_high,
+             Lblk, Hblk, Hpost, fO)
+end
+
+
+function run_segment_GRU!(models, x_in, low_state, high_state; N::Int, T::Int, cfg)
+    @assert cfg.num_tokens > 0 "GRU path expects token IDs"
+
+    # Embed and run GRU to get per-step hidden states (use Buffers; no in-place on arrays)
+    E = models.tok_emb(x_in)                 # (d_embed, L, B)
+    Flux.reset!(models.tok_rnn)
+
+    d_embed, L, B = size(E)
+
+    Hbuf = Zygote.Buffer(zeros(Float32, d_embed, L, B))  # (d_embed, L, B)
+    @inbounds for t in 1:L
+        Hbuf[:, t, :] = models.tok_rnn(E[:, t, :])       # write into Buffer (AD-safe)
+    end
+    H_seq = copy(Hbuf)                                    # materialize once
+
+    # Project each step to task space
+    Tbuf = Zygote.Buffer(zeros(Float32, cfg.d_hid, L, B)) # (d_hid, L, B)
+    @inbounds for t in 1:L
+        Tbuf[:, t, :] = models.emb_to_hid(H_seq[:, t, :])
+    end
+    e_task_seq = copy(Tbuf)
+
+    # Mask: true for real tokens, false for PAD
+    pad_mask = x_in .!= cfg.pad_id        # (L, B) Bool
+
+    # HRM outer cycles
+    @inbounds for k in 1:N
+        # collect low states across *all* time steps
+        Lbuf = Zygote.Buffer(zeros(Float32, size(low_state,1), L, B))  # (d_hid, L, B)
+
+        for t in 1:L
+            # 3-token micro-sequence for this step
+            tok_low = models.l_token_from_low(low_state)        # (d_hid, B)
+            tok_tsk = models.l_token_from_task(e_task_seq[:, t, :])  # (d_hid, B)
+            tok_hig = models.l_token_from_high(high_state)      # (d_hid, B)
+            Xl = permutedims(cat(tok_low, tok_tsk, tok_hig; dims=3), (1, 3, 2))  # (d_hid, 3, B)
+
+            # L block; propose new low state for all columns
+            Xl_out  = forward_block(models.Lblk, Xl)            # (d_hid, 3, B)
+            low_new = Xl_out[:, 1, :]
+
+            # Functional masked update (no view writes):
+            # for columns where pad_mask[t,b] == true, take low_new[:,b]; else keep low_state[:,b]
+            Mf = reshape(Float32.(pad_mask[t, :]), 1, B)        # (1, B)
+            low_state = low_state .* (1 .- Mf) .+ low_new .* Mf
+
+            Lbuf[:, t, :] = low_state
+        end
+
+        # H attends over the whole history; ignore PAD positions in the mean
+        H_in  = copy(Lbuf)                                      # (d_hid, L, B)
+        H_out = forward_block(models.Hblk, H_in)                # (d_hid, L, B)
+
+        W   = reshape(Float32.(pad_mask), 1, L, B)              # (1, L, B)
+        Hsum = dropdims(sum(H_out .* W; dims=2), dims=2)        # (d_hid, B)
+        den  = max.(dropdims(sum(W; dims=2), dims=2), 1f0)      # (1, B) avoid divide-by-zero
+        H_vec = Hsum ./ den                                     # (d_hid, B)
+
+        H_vec = models.Hpost(H_vec)
+        high_state = high_state .+ H_vec
+    end
+
+    yhat = models.fO(high_state)                                # (d_out, B)
+    return yhat, low_state, high_state
+end
+
+
+
+
+
+
 export TransformerBlock, forward_block, make_transformer_block, mean_over_len,
-       build_models, init_states, run_segment!
+       build_models, build_models_GRU, init_states, run_segment!, run_segment_GRU!
 
 
 end # module
