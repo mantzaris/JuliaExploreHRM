@@ -89,14 +89,7 @@ add_absolute_pe(X::AbstractArray, pe_layer) = begin
 end
 
 
-"""
-    forward_block(blk, X) -> Y
-
-Named forward pass for a `TransformerBlock`. `X` must be (d, L, B).
-- adds positional encodings (AbsolutePE for :sinusoidal; Flux.Embedding for :learned)
-- pre-LN + self-attention + residual, then Pre-LN + FF + residual
-"""
-function forward_block(blk::TransformerBlock, X::AbstractArray)
+function forward_block(blk::TransformerBlock, X::AbstractArray; gate::Union{Nothing,AbstractArray}=nothing)
     @assert ndims(X) == 3 "TransformerBlock expects (d, L, B)"
     d, L, B = size(X)
 
@@ -104,18 +97,24 @@ function forward_block(blk::TransformerBlock, X::AbstractArray)
     Xp = if blk.positional_encoding_kind === :none || blk.positional_layer === nothing
         X
     elseif blk.positional_encoding_kind === :sinusoidal
-        add_absolute_pe(X, blk.positional_layer)     # library PE
+        add_absolute_pe(X, blk.positional_layer)
     elseif blk.positional_encoding_kind === :learned
-        idx = reshape(collect(1:L), L, 1)            # (L, 1)
+        idx = reshape(collect(1:L), L, 1)
         E   = blk.positional_layer(idx)              # (d, L, 1)
-        X .+ E                                       # broadcast over batch
+        X .+ E
     else
         error("Unknown positional_encoding_kind=$(blk.positional_encoding_kind)")
     end
 
+    # NEW: gate after PE to keep PAD truly silent (CLS stays 1s in gate)
+    if gate !== nothing
+        @assert size(gate) == (1, L, B)
+        Xp = Xp .* gate
+    end
+
     # Pre-LN + self-attention + residual
     Xn1 = blk.norm_before_attention(Xp)
-    attn_out = blk.attention(Xn1)                    # self-attn sugar: mha(X) ≡ mha(X,X,X)
+    attn_out = blk.attention(Xn1)
     A = attn_out isa Tuple ? attn_out[1] : attn_out
     X1 = Xp .+ A
 
@@ -126,6 +125,7 @@ function forward_block(blk::TransformerBlock, X::AbstractArray)
 end
 
 
+
 # mean over length dimension (2nd dim)
 mean_over_len(X) = dropdims(mean(X; dims=2), dims=2)
 
@@ -133,19 +133,8 @@ make_transformer_block(args...; kwargs...) = TransformerBlock(args...; kwargs...
 
 getprop(nt, s::Symbol, default) = (s in propertynames(nt)) ? getproperty(nt, s) : default
 
+
 # build the HRM stack (Flux layers)
-"""
-    build_models(cfg; positional_encoding_kind=:sinusoidal, pos_L_max=0)
-
-cfg fields expected:
-  d_in, d_hid, d_out, d_embed, num_tokens,
-  l_heads, l_ff_mult, h_heads, h_ff_mult, dropout
-
-Returns a NamedTuple:
-  tok_emb, emb_to_hid, raw_to_hid,
-  l_token_from_low, l_token_from_task, l_token_from_high,
-  Lblk, Hblk, Hpost, fO
-"""
 function build_models(cfg; positional_encoding_kind::Symbol = :sinusoidal, pos_L_max::Int = 0)
     d_in        = cfg.d_in
     d_hid       = cfg.d_hid
@@ -186,13 +175,17 @@ function build_models(cfg; positional_encoding_kind::Symbol = :sinusoidal, pos_L
         positional_encoding_kind = positional_encoding_kind,
         pos_L_max = pos_L_max_eff)
 
-    # post-pool head for H, and final readout
+    
     Hpost = Flux.Chain(Flux.Dense(d_hid => d_hid, gelu))
     fO    = Flux.Chain(Flux.Dense(d_hid => d_out))
 
+    # NEW: learnable CLS vector (small init); trained automatically
+    h_cls = 0.02f0 .* randn(Float32, d_hid)
+
     return (; tok_emb, emb_to_hid, raw_to_hid,
              l_token_from_low, l_token_from_task, l_token_from_high,
-             Lblk, Hblk, Hpost, fO)
+             Lblk, Hblk, Hpost, fO,
+             h_cls) 
 end
 
 
@@ -371,14 +364,19 @@ function run_segment_GRU!(models, x_in, low_state, high_state; N::Int, T::Int, c
         end
 
         # H attends over the whole history; ignore PAD positions in the mean
-        H_in  = copy(Lbuf)                                      # (d_hid, L, B)
-        H_out = forward_block(models.Hblk, H_in)                # (d_hid, L, B)
+        H_body = copy(Lbuf)                                      # (d_hid, L, B)
+        B_     = size(H_body, 3)
+        d_hid_ = size(H_body, 1)
 
-        W   = reshape(Float32.(pad_mask), 1, L, B)              # (1, L, B)
-        Hsum = dropdims(sum(H_out .* W; dims=2), dims=2)        # (d_hid, B)
-        den  = max.(dropdims(sum(W; dims=2), dims=2), 1f0)      # (1, B) avoid divide-by-zero
-        H_vec = Hsum ./ den                                     # (d_hid, B)
+        cls = repeat(reshape(models.h_cls, d_hid_, 1, 1), 1, 1, B_)
+        H_in = cat(cls, H_body; dims=2)                          # (d_hid, L+1, B)
 
+        W     = reshape(Float32.(pad_mask), 1, L, B_)
+        W_ext = cat(ones(Float32, 1, 1, B_), W; dims=2)
+        H_in  = H_in .* W_ext
+
+        H_out = forward_block(models.Hblk, H_in; gate=W_ext)
+        H_vec = H_out[:, 1, :]                                # read CLS
         H_vec = models.Hpost(H_vec)
         high_state = high_state .+ H_vec
     end
@@ -446,14 +444,22 @@ function run_sequence_segment!(models,
             Lbuf[:, t, :] = low_state
         end
 
-        H_in  = copy(Lbuf)                                  # (d_hid, L, B)
-        H_out = forward_block(models.Hblk, H_in)            # keep simple (mask optional)
+        H_body = copy(Lbuf)                                  # (d_hid, L, B)
+        B_     = size(H_body, 3)
+        d_hid_ = size(H_body, 1)
 
-        # masked mean over time
-        W      = reshape(Float32.(pad_mask), 1, L, B)
-        H_sum  = dropdims(sum(H_out .* W; dims=2), dims=2)
-        denom  = max.(dropdims(sum(W; dims=2), dims=2), 1f0)
-        H_vec  = H_sum ./ denom
+        # NEW: prepend CLS along the length axis
+        cls = repeat(reshape(models.h_cls, d_hid_, 1, 1), 1, 1, B_)  # (d_hid, 1, B)
+        H_in = cat(cls, H_body; dims=2)                               # (d_hid, L+1, B)
+
+        # Gate out PAD time steps BEFORE attention (CLS kept as 1s)
+        W      = reshape(Float32.(pad_mask), 1, L, B_)                # (1, L, B)
+        W_ext  = cat(ones(Float32, 1, 1, B_), W; dims=2)              # (1, L+1, B)
+        H_in   = H_in .* W_ext
+
+        # H transformer; read CLS output
+        H_out  = forward_block(models.Hblk, H_in; gate=W_ext)         # (d_hid, L+1, B)
+        H_vec  = H_out[:, 1, :]
 
         H_vec      = models.Hpost(H_vec)
         high_state = high_state .+ H_vec
