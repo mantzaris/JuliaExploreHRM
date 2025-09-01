@@ -135,7 +135,11 @@ getprop(nt, s::Symbol, default) = (s in propertynames(nt)) ? getproperty(nt, s) 
 
 
 # build the HRM stack (Flux layers)
-function build_models(cfg; positional_encoding_kind::Symbol = :sinusoidal, pos_L_max::Int = 0)
+function build_models(cfg;
+                l_positional_encoding_kind::Symbol = :none,       # changed default
+                h_positional_encoding_kind::Symbol = :sinusoidal,
+                pos_L_max::Int = 0)    
+                
     d_in        = cfg.d_in
     d_hid       = cfg.d_hid
     d_out       = cfg.d_out
@@ -160,19 +164,19 @@ function build_models(cfg; positional_encoding_kind::Symbol = :sinusoidal, pos_L
     l_token_from_task = Flux.Dense(d_hid => d_hid)
     l_token_from_high = Flux.Dense(d_hid => d_hid)
 
-    # L and H Transformer blocks (same PE config)
+    # L and H Transformer blocks  
     Lblk = TransformerBlock(d_hid;
         nheads = l_heads,
         ff_mult = l_ff_mult,
         attention_dropout_probability = dropout,
-        positional_encoding_kind = positional_encoding_kind,
-        pos_L_max = pos_L_max_eff)
+        positional_encoding_kind = l_positional_encoding_kind,
+        pos_L_max = (l_positional_encoding_kind === :none ? 0 : pos_L_max_eff))
 
     Hblk = TransformerBlock(d_hid;
         nheads = h_heads,
         ff_mult = h_ff_mult,
         attention_dropout_probability = dropout,
-        positional_encoding_kind = positional_encoding_kind,
+        positional_encoding_kind = h_positional_encoding_kind,
         pos_L_max = pos_L_max_eff)
 
     
