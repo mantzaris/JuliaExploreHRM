@@ -8,50 +8,100 @@ struct VarNode <: BoolNode; var_index::Int; end
 struct NotNode <: BoolNode; child::BoolNode; end
 struct BinNode <: BoolNode; operation::Symbol; left::BoolNode; right::BoolNode; end
 
-function generate_boolean_tree(rng::AbstractRNG; min_depth::Int=2, max_depth::Int=4, 
-                              variable_count::Int=5, held_out_ops::Set{Symbol}=Set{Symbol}())
+
+function generate_boolean_tree(rng::AbstractRNG; min_depth::Int=2, max_depth::Int=4,
+                               variable_count::Int=5, held_out_ops::Set{Symbol}=Set{Symbol}(),
+                               mode::Symbol=:exact)
+    @assert min_depth >= 1 "min_depth must be >= 1"
+    @assert max_depth >= min_depth "max_depth must be >= min_depth"
+    @assert variable_count >= 1 "variable_count must be >= 1"
+
     all_ops = (:AND, :OR, :XOR, :NAND)
     available_ops = [op for op in all_ops if op ∉ held_out_ops]
     isempty(available_ops) && error("No operations available")
-    
-    function gen(depth::Int)
-        if depth <= 1
-            return VarNode(rand(rng, 1:variable_count))
+
+    # --- helper to draw a variable index safely
+    draw_var() = VarNode(rand(rng, 1:variable_count))
+
+    # --- EXACT mode: guarantee depth == target_depth by construction
+    function gen_exact(depth::Int)::BoolNode
+        if depth == 1
+            return draw_var()
         end
-        
-        choice = rand(rng, [:var, :not, :op, :op, :op])  # Bias toward ops
-        
-        if choice == :var
-            return VarNode(rand(rng, 1:variable_count))
-        elseif choice == :not
-            return NotNode(gen(depth - 1))
+        # Disallow early :var. Choose between unary NOT or binary op.
+        choice = rand(rng, [:not, :op, :op])  # bias to binary
+        if choice == :not
+            # NOT must propagate the "must reach" budget
+            return NotNode(gen_exact(depth - 1))
         else
             op = rand(rng, available_ops)
-            left_depth = rand(rng, 1:(depth-1))
-            right_depth = rand(rng, 1:(depth-1))
-            return BinNode(op, gen(left_depth), gen(right_depth))
+            # Ensure one branch *must* reach depth-1; the other can be anything (loose)
+            if rand(rng, Bool)
+                left  = gen_exact(depth - 1)
+                # right is allowed to be smaller
+                right = gen_loose(rand(rng, 1:(depth - 1)))
+                return BinNode(op, left, right)
+            else
+                left  = gen_loose(rand(rng, 1:(depth - 1)))
+                right = gen_exact(depth - 1)
+                return BinNode(op, left, right)
+            end
         end
     end
-    
-    for _ in 1:100
-        target_depth = rand(rng, min_depth:max_depth)
-        tree = gen(target_depth)
-        if min_depth <= tree_depth(tree) <= max_depth
-            return tree
+
+    # --- LOOSE mode: your original stochastic program (slightly refactored)
+    function gen_loose(depth::Int)::BoolNode
+        if depth <= 1
+            return draw_var()
+        end
+        choice = rand(rng, [:var, :not, :op, :op, :op])  # bias toward ops
+        if choice == :var
+            return draw_var()
+        elseif choice == :not
+            return NotNode(gen_loose(depth - 1))
+        else
+            op = rand(rng, available_ops)
+            left_depth  = rand(rng, 1:(depth - 1))
+            right_depth = rand(rng, 1:(depth - 1))
+            return BinNode(op, gen_loose(left_depth), gen_loose(right_depth))
         end
     end
-    
-    # Fallback
-    return BinNode(first(available_ops), VarNode(1), VarNode(2))
+
+    # --- main logic
+    target_depth = rand(rng, min_depth:max_depth)
+    if mode === :exact
+        return gen_exact(target_depth)
+    elseif mode === :loose
+        # rejection sampling as in your code, but with safe fallback
+        for _ in 1:200  # allow a few more tries for deep ranges
+            tree = gen_loose(target_depth)
+            d = tree_depth(tree)
+            if min_depth <= d <= max_depth
+                return tree
+            end
+        end
+        # Safe fallback that never violates variable_count
+        if variable_count == 1
+            return NotNode(VarNode(1))
+        else
+            return BinNode(first(available_ops), VarNode(1), VarNode(2))
+        end
+    else
+        error("Unknown mode = $mode; use :loose or :exact")
+    end
 end
+
+
 
 function tree_depth(node::BoolNode)::Int
     if node isa VarNode
         return 1
     elseif node isa NotNode
         return 1 + tree_depth(node.child)
-    else
+    elseif node isa BinNode
         return 1 + max(tree_depth(node.left), tree_depth(node.right))
+    else
+        error("Unknown node type")
     end
 end
 
@@ -61,7 +111,7 @@ function eval_boolean_tree(node::BoolNode, var_values::Vector{Bool})::Bool
     elseif node isa NotNode
         return !eval_boolean_tree(node.child, var_values)
     else
-        left_val = eval_boolean_tree(node.left, var_values)
+        left_val  = eval_boolean_tree(node.left, var_values)
         right_val = eval_boolean_tree(node.right, var_values)
         if node.operation === :AND
             return left_val & right_val
@@ -72,7 +122,7 @@ function eval_boolean_tree(node::BoolNode, var_values::Vector{Bool})::Bool
         elseif node.operation === :NAND
             return !(left_val & right_val)
         else
-            error("Unknown operation")
+            error("Unknown operation $(node.operation)")
         end
     end
 end
@@ -87,55 +137,43 @@ function boolean_tree_to_prefix(node::BoolNode)::String
     end
 end
 
-"""
-Generate boolean formula dataset.
 
-Parameters:
-- n: Number of samples
-- variable_count: Number of variables (default 5)
-- min_depth, max_depth: Tree depth range (default 2-4)
-- held_out_ops: Operations to exclude (default none)
-- seed: Random seed (default 42)
+function generate_data(n::Int=100;
+                       variable_count::Int=5,
+                       min_depth::Int=2,
+                       max_depth::Int=4,
+                       held_out_ops::Vector{Symbol}=Symbol[],
+                       seed::Int=42,
+                       mode::Symbol=:loose)
 
-Returns:
-- X: Matrix of variable assignments (n x variable_count)
-- y: Vector of labels (n,)
-- expressions: Vector of expression strings (n,)
-"""
-function generate_data(n::Int=100; 
-                      variable_count::Int=5,
-                      min_depth::Int=2, 
-                      max_depth::Int=4,
-                      held_out_ops::Vector{Symbol}=Symbol[],
-                      seed::Int=42)
-    
     rng = MersenneTwister(seed)
     held_out_set = Set(held_out_ops)
-    
+
     X = zeros(Int, n, variable_count)
     y = zeros(Int, n)
     expressions = String[]
-    
+
     for i in 1:n
-        tree = generate_boolean_tree(rng; 
-            min_depth=min_depth, 
-            max_depth=max_depth,
-            variable_count=variable_count,
-            held_out_ops=held_out_set)
-        
+        tree = generate_boolean_tree(rng;
+            min_depth=min_depth, max_depth=max_depth,
+            variable_count=variable_count, held_out_ops=held_out_set,
+            mode=mode)
+
         var_vals = rand(rng, Bool, variable_count)
-        result = eval_boolean_tree(tree, var_vals)
-        expr = boolean_tree_to_prefix(tree)
-        
+        result   = eval_boolean_tree(tree, var_vals)
+        expr     = boolean_tree_to_prefix(tree)
+
         X[i, :] = [v ? 1 : 0 for v in var_vals]
-        y[i] = result ? 1 : 0
+        y[i]    = result ? 1 : 0
         push!(expressions, expr)
     end
-    
+
     return X, y, expressions
 end
 
-export generate_data
+export generate_data, generate_boolean_tree, tree_depth,
+       eval_boolean_tree, boolean_tree_to_prefix
+
 
 end
 
