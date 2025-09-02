@@ -6,9 +6,7 @@ using Zygote
 using Random, Statistics
 using PositionalEmbeddings 
 
-# ------------------------------
 # Transformer block (Pre-LN MHA)
-# ------------------------------
 """
 A minimal Transformer block compatible with (d, L, B) tensors.
 
@@ -114,14 +112,12 @@ function forward_block(blk::TransformerBlock, X::AbstractArray; gate::Union{Noth
     return X1 .+ F
 end
 
-# Utilities
 mean_over_len(X) = dropdims(mean(X; dims=2), dims=2)
 make_transformer_block(args...; kwargs...) = TransformerBlock(args...; kwargs...)
 getprop(nt, s::Symbol, default) = (s in propertynames(nt)) ? getproperty(nt, s) : default
 
-# ------------------------------
+
 # H+H model (two "high" modules)
-# ------------------------------
 """
 build_models(cfg; l_positional_encoding_kind=:sinusoidal, h_positional_encoding_kind=:sinusoidal, pos_L_max=0)
 
