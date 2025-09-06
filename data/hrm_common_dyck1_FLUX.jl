@@ -302,9 +302,10 @@ function build_models_GRU(cfg; positional_encoding_kind::Symbol = :sinusoidal, p
     Hpost = Flux.Chain(Flux.Dense(d_hid => d_hid, gelu))
     fO    = Flux.Chain(Flux.Dense(d_hid => d_out))
 
+    h_cls = 0.02f0 .* randn(Float32, cfg.d_hid)
     return (; tok_emb, tok_rnn, emb_to_hid, raw_to_hid,
              l_token_from_low, l_token_from_task, l_token_from_high,
-             Lblk, Hblk, Hpost, fO)
+             Lblk, Hblk, Hpost, fO, h_cls)
 end
 
 
@@ -412,8 +413,10 @@ function run_sequence_segment!(models,
     d_hid = size(low_state, 1)
 
     # key-padding mask (true = keep)
-    pad_id   = get(cfg, :pad_id, 0)
-    pad_mask = pad_id == 0 ? trues(L, B) : (token_ids .!= pad_id)
+    pad_id   = get(cfg, :pad_id, nothing)
+    @assert pad_id !== nothing "cfg.pad_id must be set to a valid token index used for padding."
+    pad_mask = (token_ids .!= pad_id)   # Bool (L,B): true = real token, false = pad
+
 
     # preallocate 3-token micro-sequence
     Xl = Array{Float32}(undef, d_hid, 3, B)

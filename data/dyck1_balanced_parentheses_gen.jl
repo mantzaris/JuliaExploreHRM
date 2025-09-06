@@ -256,7 +256,9 @@ function corrupt_strict_equalcount(s::String)::String
     return ")" * (length(s) > 2 ? s[2:end-1] : "") * "("
 end
 
-"Dataset with zero label-noise for negatives AND equal '(' / ')' counts."
+
+
+
 function make_dataset_strict_equalcount(rng::AbstractRNG; N::Int=10_000,
                                         n_range::UnitRange{Int}=2:8,
                                         negative_ratio::Float64=0.5)
@@ -269,10 +271,96 @@ function make_dataset_strict_equalcount(rng::AbstractRNG; N::Int=10_000,
         if is_positive
             xs[i] = s; ys[i] = 1
         else
-            xs[i] = corrupt_strict_equalcount(s); ys[i] = 0
+            xs[i] = corrupt_strict_equalcount_checked(rng, s); ys[i] = 0
         end
     end
     return xs, ys
 end
+
+
+
+
+"Prefix depths d[0..L] with d[0]=0, d[k]=#'(' - #')' in s[1:k]."
+function _prefix_depths(s::String)
+    L = length(s)
+    d = Vector{Int}(undef, L+1)
+    d[1] = 0
+    @inbounds for i in 1:L
+        d[i+1] = d[i] + (s[i] == '(' ? 1 : -1)
+    end
+    return d
+end
+
+
+function corrupt_strict_equalcount_checked(rng::AbstractRNG, s::String;
+                                           max_tries::Int=200,
+                                           forbid_first_last::Bool=true)::String
+    @assert !isempty(s)
+    L = length(s)
+    @assert L ≥ 2
+
+    # Build string by flipping exactly two positions i != j ( '(' <-> ')' ), preserving total counts.
+    @inline function build_flip2(i::Int, j::Int)
+        @assert s[i] != s[j]
+        ci = (s[i] == '(') ? ')' : '('
+        cj = (s[j] == '(') ? ')' : '('
+        if i > j
+            i, j = j, i
+            ci, cj = cj, ci
+        end
+        left  = (i > 1) ? s[1:i-1] : ""
+        mid   = (i+1 <= j-1) ? s[i+1:j-1] : ""
+        right = (j < L) ? s[j+1:end] : ""
+        return string(left, ci, mid, cj, right)
+    end
+
+    # Strategy A: flip at a "zero-prefix '(' " to force an immediate prefix violation,
+    # then compensate later by flipping one later ')'.
+    for _ in 1:max_tries
+        d = _prefix_depths(s)  # length L+1
+        zero_starts = Int[]
+        @inbounds for i in 2:(L-1)
+            if d[i] == 0 && s[i] == '('     # depth before s[i] is 0
+                push!(zero_starts, i)
+            end
+        end
+        i = isempty(zero_starts) ? rand(rng, 2:(L-1)) : rand(rng, zero_starts)
+
+        later_closes = Int[]
+        @inbounds for j in (i+1):(L-1)      # avoid last char to reduce trivial ends
+            s[j] == ')' && push!(later_closes, j)
+        end
+        if isempty(later_closes)
+            for j in (i+1):L
+                s[j] == ')' && (push!(later_closes, j); break)
+            end
+        end
+        isempty(later_closes) && continue
+        j = rand(rng, later_closes)
+
+        if s[i] != s[j]
+            cand = build_flip2(i, j)
+            if (!forbid_first_last || (cand[1] != ')' && cand[end] != '(')) && !is_balanced(cand)
+                return cand
+            end
+        end
+    end
+
+    # Strategy B: brute-force i<j to find any non-trivial unbalanced candidate (still equal-count).
+    for i in 2:(L-1), j in (i+1):(L-1)
+        if s[i] != s[j]
+            cand = build_flip2(i, j)
+            if (!forbid_first_last || (cand[1] != ')' && cand[end] != '(')) && !is_balanced(cand)
+                return cand
+            end
+        end
+    end
+
+    # Last resort for very short strings: force ')...(' (trivial cue, but always unbalanced)
+    return ")" * (L > 2 ? s[2:end-1] : "") * "("
+end
+
+
+
 
 end # module
