@@ -294,7 +294,6 @@ end
 
 
 
-# local helpers so we don't have to touch the module
 prefix_depths(s::String) = begin
     L = length(s)
     d = Vector{Int}(undef, L+1); d[1] = 0
