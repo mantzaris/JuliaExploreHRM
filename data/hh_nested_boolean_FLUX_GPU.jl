@@ -6,18 +6,33 @@ using Zygote
 using Random, Statistics
 using PositionalEmbeddings 
 using Adapt
+using Functors: @functor
+using CUDA: CuArray, cu
+using ChainRulesCore: ignore_derivatives
 
 
 device_similar(template::AbstractArray, ::Type{T}, dims::Int...) where {T} =
     similar(template, T, dims...)
 
 device_zeros(template::AbstractArray, ::Type{T}, dims::Int...) where {T} =
-    fill!(device_similar(template, T, dims...), zero(T))
+    ignore_derivatives() do
+        template isa CuArray ? CUDA.zeros(T, dims...) : zeros(T, dims...)
+    end
 
 device_ones(template::AbstractArray, ::Type{T}, dims::Int...) where {T} =
-    fill!(device_similar(template, T, dims...), one(T))
+    ignore_derivatives() do
+        template isa CuArray ? CUDA.ones(T,  dims...) : ones(T,  dims...)
+    end
+
+Zygote.@nograd device_similar
+Zygote.@nograd device_zeros
+Zygote.@nograd device_ones
+
 
 adapt_like(x, template) = Adapt.adapt(typeof(template), x)
+
+to_device_like_indices(x, template) = template isa CuArray ? cu(x) : x
+Zygote.@nograd to_device_like_indices
 
 
 function __init__()
@@ -42,8 +57,7 @@ struct TransformerBlock{PL}
     norm_before_feedforward::Flux.LayerNorm
 end
 
-Flux.@functor TransformerBlock   
-
+@functor TransformerBlock
 
 """
     TransformerBlock(d;
@@ -201,8 +215,8 @@ function build_models(cfg;
     fO     = Flux.Chain(Flux.Dense(d_hid => d_out))
 
     # learned CLS vectors (small init)
-    h1_cls = Flux.param(0.02f0 .* randn(Float32, d_hid))
-    h2_cls = Flux.param(0.02f0 .* randn(Float32, d_hid))
+    h1_cls = 0.02f0 .* randn(Float32, d_hid)
+    h2_cls = 0.02f0 .* randn(Float32, d_hid)
 
     return (; tok_emb, emb_to_hid, raw_to_hid,
              H1blk, H2blk, H1post, H2post, fO,
@@ -249,7 +263,8 @@ function run_sequence_segment!(models,
     Tbuf = Zygote.Buffer(device_zeros(high1_state, eltype(high1_state), d_hid, L, B))
     @inbounds for t in 1:L
         ids_t = @view token_ids[t, :]
-        E_t   = models.tok_emb(adapt_like(ids_t, high1_state))  # indices -> device of activations
+        E_t   = models.tok_emb(to_device_like_indices(ids_t, high1_state))   
+
         e_t   = models.emb_to_hid(E_t)                          # (d_hid, B)
         Tbuf[:, t, :] = e_t
     end
