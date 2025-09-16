@@ -29,10 +29,18 @@ device_ones(template::AbstractArray, ::Type{T}, dims::Int...) where {T} =
         template isa CuArray ? CUDA.ones(T,  dims...) : ones(T,  dims...)
     end
 
+to_device_and_match_eltype(x, template) = begin
+        y = to_device_like(x, template)
+        eltype(template).(y)             # elementwise convert; AD-safe identity on values
+end
+
+to_device_like(x, template) = template isa CuArray ? cu(x) : x
+    Zygote.@nograd to_device_like
+
 Zygote.@nograd device_similar
 Zygote.@nograd device_zeros
 Zygote.@nograd device_ones
-
+Zygote.@nograd to_device_and_match_eltype
 
 
 # Adapt 'x' to live on the same device/type as 'template'
@@ -40,6 +48,9 @@ adapt_like(x, template) = Adapt.adapt(typeof(template), x)
 
 to_device_like_indices(x, template) = template isa CuArray ? cu(x) : x
 Zygote.@nograd to_device_like_indices
+
+
+
 
 
 # transformer block (Pre-LN, MHA, FF, residual)
@@ -117,47 +128,45 @@ end
 add_absolute_pe(X::AbstractArray, pe_layer) = begin
     X_perm = permutedims(X, (2, 1, 3))             # (L, d, B)
     X_pos  = pe_layer(X_perm)                       # may be CPU or GPU depending on layer
-    X_pos  = adapt_like(X_pos, X)                   # ensure same device/type as X
+    X_pos  = to_device_and_match_eltype(X_pos, X)      # move/cast, but AD won’t enter CUDA internals
     permutedims(X_pos, (2, 1, 3))                   # (d, L, B)
 end
 
 
 function forward_block(blk::TransformerBlock, X::AbstractArray; gate::Union{Nothing,AbstractArray}=nothing)
-    @assert ndims(X) == 3 "TransformerBlock expects (d, L, B)"
+    @assert ndims(X) == 3
     d, L, B = size(X)
 
-    # Positional encoding
     Xp = if blk.positional_encoding_kind === :none || blk.positional_layer === nothing
         X
     elseif blk.positional_encoding_kind === :sinusoidal
         add_absolute_pe(X, blk.positional_layer)
     elseif blk.positional_encoding_kind === :learned
-        idx = reshape(collect(1:L), L, 1)                # Int indices
-        idx_dev = to_device_like_indices(idx, X)         # move to device, keep Int
-        E   = blk.positional_layer(idx_dev)              # (d, L, 1)
+        idx = reshape(collect(1:L), L, 1)
+        idx_dev = to_device_like_indices(idx, X)
+        E   = blk.positional_layer(idx_dev)
         X .+ E
-    
     else
         error("Unknown positional_encoding_kind=$(blk.positional_encoding_kind)")
     end
 
-    # NEW: gate after PE to keep PAD truly silent (CLS stays 1s in gate)
+    # **Adapt gate dtype+device like H+H**
     if gate !== nothing
         @assert size(gate) == (1, L, B)
-        Xp = Xp .* gate
+        gate_dev = to_device_and_match_eltype(gate, X)  # move + match dtype
+        Xp = Xp .* gate_dev
     end
 
-    # Pre-LN + self-attention + residual
     Xn1 = blk.norm_before_attention(Xp)
     attn_out = blk.attention(Xn1)
     A = attn_out isa Tuple ? attn_out[1] : attn_out
     X1 = Xp .+ A
 
-    # Pre-LN + FF + residual
     Xn2 = blk.norm_before_feedforward(X1)
     F   = blk.feedforward(Xn2)
     return X1 .+ F
 end
+
 
 
 
@@ -462,89 +471,86 @@ make_recur_gru(din::Int, dhid::Int) = begin
 end
 
 
+
 function run_sequence_segment!(models,
-                               token_ids::AbstractMatrix{<:Integer},
-                               low_state::AbstractArray,
-                               high_state::AbstractArray;
-                               N::Int,
-                               cfg,
-                               lengths::Union{Nothing,AbstractVector{<:Integer}}=nothing)
+    token_ids::AbstractMatrix{<:Integer},
+    low_state::AbstractArray,
+    high_state::AbstractArray;
+    N::Int,
+    cfg,
+    lengths::Union{Nothing,AbstractVector{<:Integer}}=nothing)
+
     @assert cfg.num_tokens > 0 "run_sequence_segment! expects token IDs"
-    L, B = size(token_ids)
+
+    L, B  = size(token_ids)
     d_hid = size(low_state, 1)
 
-    # key-padding mask (true = keep)
-    pad_id   = getprop(cfg, :pad_id, 0)
-    pad_mask = pad_id == 0 ? trues(L, B) : (token_ids .!= pad_id)
+    # --- Masks (build once, then adapt to device) ---------------------------
+    pad_id         = getprop(cfg, :pad_id, 0)
+    pad_mask_cpu   = pad_id == 0 ? trues(L, B) : (token_ids .!= pad_id)   # CPU Bool
+    pad_mask_dev   = to_device_like_indices(pad_mask_cpu, low_state)      # Bool on model's device
 
-    # preallocate 3-token micro-sequence
+    # --- Precompute per-step task embeddings e_seq :: (d_hid, L, B) --------
+    Tbuf = Zygote.Buffer(device_zeros(low_state, eltype(low_state), d_hid, L, B))
+    @inbounds for t in 1:L
+        ids_t = @view token_ids[t, :]
+        emb_t = models.tok_emb(to_device_like_indices(ids_t, low_state))       # (d_embed, B)
+        Tbuf[:, t, :] = models.emb_to_hid(emb_t)                               # (d_hid,  B)
+    end
+    e_seq = copy(Tbuf)                                                          # (d_hid, L, B)
 
-    @inbounds for k in 1:N
+    # --- Gate for H (Bool; forward_block will adapt dtype) ------------------
+    W_ext_bool = cat(device_ones(low_state, Bool, 1, 1, B),     # CLS position is always valid
+                     reshape(pad_mask_dev, 1, L, B); dims=2)    # (1, L+1, B)
+
+    @inbounds for cycle in 1:N
+        # Collect low states across time
         Lbuf = Zygote.Buffer(device_zeros(low_state, eltype(low_state), d_hid, L, B))
 
+        # token_high stays constant within a cycle
+        token_high = models.l_token_from_high(high_state)     # (d_hid, B)
+
         for t in 1:L
-            ids_t = @view token_ids[t, :]
-            E_t   = models.tok_emb(to_device_like_indices(ids_t, low_state))
+            token_low  = models.l_token_from_low(low_state)     # (d_hid, B)
+            token_task = models.l_token_from_task(e_seq[:, t, :])
 
+            # 3-token micro-sequence: (low, task, high), shape (d_hid, 3, B)
+            X_l = cat(reshape(token_low,  d_hid, 1, B),
+                      reshape(token_task, d_hid, 1, B),
+                      reshape(token_high, d_hid, 1, B); dims=2)
 
-            e_t   = models.emb_to_hid(E_t)                 # (d_hid,   B)
+            X_l_out  = forward_block(models.Lblk, X_l)
+            low_new  = @view X_l_out[:, 1, :]                           # (d_hid, B)
 
-            tok_low = models.l_token_from_low(low_state)
-            tok_tsk = models.l_token_from_task(e_t)
-            tok_hig = models.l_token_from_high(high_state)
-
-            Xl = cat(
-                reshape(tok_low, d_hid, 1, B),
-                reshape(tok_tsk, d_hid, 1, B),
-                reshape(tok_hig, d_hid, 1, B);
-                dims = 2,
-            )
-
-            Xl_out = forward_block(models.Lblk, Xl)
-
-            
-            low_new = @view Xl_out[:, 1, :]
-
-            # masked low_state update across batch
-            Telt = eltype(low_state)
-            Mf_cpu = reshape(Telt.(pad_mask[t, :]), 1, B)
-            
-            Mf     = adapt_like(Mf_cpu, low_state)
-            low_state = low_state .* (1 .- Mf) .+ low_new .* Mf
+            # Masked update: keep previous state where token is PAD
+            mask_t = reshape(pad_mask_dev[t, :], 1, B)                  # (1, B) Bool on device
+            low_state = ifelse.(mask_t, low_new, low_state)
 
             Lbuf[:, t, :] = low_state
         end
 
-        H_body = copy(Lbuf)                                  # (d_hid, L, B)
-        B_     = size(H_body, 3)
+        # High block over [CLS, low_states]; gate with mask (CLS always passes)
+        H_body = copy(Lbuf)                                              # (d_hid, L,   B)
         d_hid_ = size(H_body, 1)
 
-        # NEW: prepend CLS along the length axis
-        cls_cpu = reshape(eltype(H_body).(models.h_cls), d_hid_, 1, 1)  # convert dtype first
-        cls1    = adapt_like(cls_cpu, H_body)                           # then move to the right device
-        cls     = repeat(cls1, 1, 1, B_)
+        cls_1  = reshape(eltype(H_body).(models.h_cls), d_hid_, 1, 1)    # (d_hid,1,1)
+        cls_1  = to_device_like(cls_1, H_body)
+        cls    = repeat(cls_1, 1, 1, B)                                  # (d_hid,1,B)
+        H_in   = cat(cls, H_body; dims=2)                                # (d_hid, L+1, B)
 
-        H_in = cat(cls, H_body; dims=2)                               # (d_hid, L+1, B)
-
-        # Gate out PAD time steps BEFORE attention (CLS kept as 1s)
-        
-        TH = eltype(H_body)
-        W_cpu = reshape(TH.(pad_mask), 1, L, B_)
-        W     = adapt_like(W_cpu, H_body)
-        W_ext = cat(device_ones(H_body, TH, 1, 1, B_), W; dims=2)
-        H_in   = H_in .* W_ext
-
-        # H transformer; read CLS output
-        H_out  = forward_block(models.Hblk, H_in; gate=W_ext)
-        H_vec  = H_out[:, 1, :]
-
-        H_vec      = models.Hpost(H_vec)
+        H_out  = forward_block(models.Hblk, H_in; gate=W_ext_bool)
+        H_vec  = models.Hpost(H_out[:, 1, :])                             # read CLS token
         high_state = high_state .+ H_vec
     end
 
-    yhat = models.fO(high_state)
+    yhat = models.fO(high_state)                                          # (d_out, B)
     return yhat, low_state, high_state
 end
+
+
+
+
+
 
 export TransformerBlock, forward_block, make_transformer_block, mean_over_len,
        build_models, build_models_GRU, init_states,
