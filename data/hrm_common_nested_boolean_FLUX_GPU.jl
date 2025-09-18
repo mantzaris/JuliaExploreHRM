@@ -448,8 +448,7 @@ function run_segment_GRU!(models, x_in, low_state, high_state; N::Int, T::Int, c
         W_cpu = reshape(TH.(pad_mask), 1, L, B_)
         W     = adapt_like(W_cpu, H_body)
         W_ext = cat(device_ones(H_body, TH, 1, 1, B_), W; dims=2)
-        H_in   = H_in .* W_ext
-        H_out  = forward_block(models.Hblk, H_in; gate=W_ext)
+        H_out = forward_block(models.Hblk, H_in; gate=W_ext)
 
         H_vec = H_out[:, 1, :]                                # read CLS
         H_vec = models.Hpost(H_vec)
@@ -503,6 +502,14 @@ function run_sequence_segment!(models,
     W_ext_bool = cat(device_ones(low_state, Bool, 1, 1, B),     # CLS position is always valid
                      reshape(pad_mask_dev, 1, L, B); dims=2)    # (1, L+1, B)
 
+                     # --- Precompute the L-path task adapter for all time steps (batched) ----
+    # e_seq has shape (d_hid, L, B) on the model's device/dtype
+    # Dense runs once on the flattened (d_hid, L*B) and is reshaped back.
+    d_hid, L_, B_ = size(e_seq)
+    @assert L_ == L && B_ == B
+    task_all_flat = models.l_token_from_task(reshape(e_seq, d_hid, L*B))
+    task_all      = reshape(task_all_flat, d_hid, L, B)
+
     @inbounds for cycle in 1:N
         # Collect low states across time
         Lbuf = Zygote.Buffer(device_zeros(low_state, eltype(low_state), d_hid, L, B))
@@ -512,7 +519,7 @@ function run_sequence_segment!(models,
 
         for t in 1:L
             token_low  = models.l_token_from_low(low_state)     # (d_hid, B)
-            token_task = models.l_token_from_task(e_seq[:, t, :])
+            token_task = @view task_all[:, t, :]
 
             # 3-token micro-sequence: (low, task, high), shape (d_hid, 3, B)
             X_l = cat(reshape(token_low,  d_hid, 1, B),
